@@ -17,7 +17,17 @@ coerce_stream_message({http, {ReqId, stream, BinBodyPart}})
 coerce_stream_message({http, {ReqId, stream_end, Headers}}) ->
     {raw_stream_end, ReqId, Headers};
 coerce_stream_message({http, {ReqId, {error, Reason}}}) ->
-    {raw_stream_error, ReqId, normalise_error(Reason)}. 
+    {raw_stream_error, ReqId, normalise_error(Reason)};
+coerce_stream_message({http, {ReqId, {{_Version, Status, _Reason}, Headers, Body}}})
+    when is_integer(Status), is_binary(Body) ->
+    BinHeaders = [{unicode:characters_to_binary(K), unicode:characters_to_binary(V)}
+                  || {K, V} <- Headers],
+    {raw_stream_error, ReqId, {unexpected_response, {response, Status, BinHeaders, Body}}};
+coerce_stream_message({http, {ReqId, {{_Version, Status, _Reason}, Headers, Body}}})
+    when is_integer(Status), is_list(Body) ->
+    BinHeaders = [{unicode:characters_to_binary(K), unicode:characters_to_binary(V)}
+                  || {K, V} <- Headers],
+    {raw_stream_error, ReqId, {unexpected_response, {response, Status, BinHeaders, erlang:list_to_binary(Body)}}}.
   
 %%====================================================================
 %% Error normalization

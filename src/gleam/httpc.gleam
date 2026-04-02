@@ -20,6 +20,8 @@ pub type HttpError {
   ResponseTimeout
   /// The connection was closed mid-response
   SocketClosedRemotely
+  /// The server sent a complete response instead of streaming chunks.
+  UnexpectedResponse(response: Response(BitArray))
 }
 
 pub type ConnectError {
