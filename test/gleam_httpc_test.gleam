@@ -93,6 +93,7 @@ pub fn invalid_tls_test() {
   assert 200 == response.status
 }
 
+// This always fails in CI with enetunreach
 pub fn ipv6_test() {
   // This URL is ipv6 only
   let assert Ok(req) = request.to("https://ipv6.google.com")
