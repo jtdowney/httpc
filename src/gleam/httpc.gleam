@@ -6,6 +6,7 @@ import gleam/http/request.{type Request}
 import gleam/http/response.{type Response, Response}
 import gleam/list
 import gleam/result
+import gleam/string
 import gleam/uri
 
 pub type HttpError {
@@ -41,6 +42,7 @@ type BodyFormat {
 type ErlOption {
   BodyFormat(BodyFormat)
   SocketOpts(List(SocketOpt))
+  Ipv6HostWithBrackets(Bool)
 }
 
 type SocketOpt {
@@ -81,6 +83,20 @@ fn erl_request_no_body(
   Dynamic,
 )
 
+/// `gleam/uri` parses IPv6 hosts without their surrounding brackets, but
+/// Erlang's httpc requires them to be present in the URL.
+///
+fn bracket_ipv6_host(host: String) -> String {
+  case host {
+    "[" <> _ -> host
+    _ ->
+      case string.contains(host, ":") {
+        True -> "[" <> host <> "]"
+        False -> host
+      }
+  }
+}
+
 fn string_header(header: #(Charlist, Charlist)) -> #(String, String) {
   let #(k, v) = header
   #(charlist.to_string(k), charlist.to_string(v))
@@ -107,6 +123,7 @@ pub fn dispatch_bits(
 ) -> Result(Response(BitArray), HttpError) {
   let erl_url =
     req
+    |> request.set_host(bracket_ipv6_host(req.host))
     |> request.to_uri
     |> uri.to_string
     |> charlist.from_string
@@ -119,7 +136,11 @@ pub fn dispatch_bits(
     True -> erl_http_options
     False -> [Ssl([Verify(VerifyNone)]), ..erl_http_options]
   }
-  let erl_options = [BodyFormat(Binary), SocketOpts([Ipfamily(Inet6fb4)])]
+  let erl_options = [
+    BodyFormat(Binary),
+    SocketOpts([Ipfamily(Inet6fb4)]),
+    Ipv6HostWithBrackets(True),
+  ]
 
   use response <- result.try(
     case req.method {

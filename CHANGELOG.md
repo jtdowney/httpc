@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed a bug where requests to IPv6 literal hosts would fail.
+
 ## v5.0.0 - 2025-07-12
 
 - Added the `timeout` configuration option and associated error.

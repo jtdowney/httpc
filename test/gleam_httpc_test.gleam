@@ -101,6 +101,14 @@ pub fn ipv6_test() {
   assert 200 == resp.status
 }
 
+// This always fails in CI with enetunreach
+pub fn ipv6_literal_host_test() {
+  let assert Ok(req) =
+    request.to("https://[2001:4860:4860::8888]/resolve?name=gleam.run&type=A")
+  let assert Ok(resp) = httpc.send(req)
+  assert 200 == resp.status
+}
+
 pub fn follow_redirects_option_test() {
   // This redirects to https://
   let assert Ok(req) = request.to("http://packages.gleam.run")
