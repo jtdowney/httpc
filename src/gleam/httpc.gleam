@@ -1,6 +1,8 @@
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
+import gleam/erlang/atom
 import gleam/erlang/charlist.{type Charlist}
+import gleam/erlang/process
 import gleam/http.{type Method}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response, Response}
@@ -16,6 +18,10 @@ pub type HttpError {
   FailedToConnect(ip4: ConnectError, ip6: ConnectError)
   /// The response was not received within the configured timeout period.
   ResponseTimeout
+  /// The server closed the connection before the response was complete.
+  SocketClosedRemotely
+  /// The server sent a response that could not be understood as HTTP.
+  InvalidResponse
 }
 
 pub type ConnectError {
@@ -43,6 +49,9 @@ type ErlOption {
   BodyFormat(BodyFormat)
   SocketOpts(List(SocketOpt))
   Ipv6HostWithBrackets(Bool)
+  Sync(Bool)
+  Stream(#(atom.Atom, atom.Atom))
+  Receiver(#(atom.Atom, atom.Atom, List(process.Pid)))
 }
 
 type SocketOpt {
@@ -121,42 +130,22 @@ pub fn dispatch_bits(
   config: Configuration,
   req: Request(BitArray),
 ) -> Result(Response(BitArray), HttpError) {
-  let erl_url =
-    req
-    |> request.set_host(bracket_ipv6_host(req.host))
-    |> request.to_uri
-    |> uri.to_string
-    |> charlist.from_string
-  let erl_headers = prepare_headers(req.headers)
-  let erl_http_options = [
-    Autoredirect(config.follow_redirects),
-    Timeout(config.timeout),
-  ]
-  let erl_http_options = case config.verify_tls {
-    True -> erl_http_options
-    False -> [Ssl([Verify(VerifyNone)]), ..erl_http_options]
-  }
-  let erl_options = [
-    BodyFormat(Binary),
-    SocketOpts([Ipfamily(Inet6fb4)]),
-    Ipv6HostWithBrackets(True),
-  ]
+  let url = erl_url(req)
+  let headers = prepare_headers(req.headers)
+  let http_options = erl_http_options(config)
+  let options = base_erl_options()
 
   use response <- result.try(
-    case req.method {
-      http.Options | http.Head | http.Get -> {
-        let erl_req = #(erl_url, erl_headers)
-        erl_request_no_body(req.method, erl_req, erl_http_options, erl_options)
-      }
-      _ -> {
-        let erl_content_type =
-          req
-          |> request.get_header("content-type")
-          |> result.unwrap("application/octet-stream")
-          |> charlist.from_string
-        let erl_req = #(erl_url, erl_headers, erl_content_type, req.body)
-        erl_request(req.method, erl_req, erl_http_options, erl_options)
-      }
+    case method_has_body(req.method) {
+      False ->
+        erl_request_no_body(req.method, #(url, headers), http_options, options)
+      True ->
+        erl_request(
+          req.method,
+          #(url, headers, erl_content_type(req), req.body),
+          http_options,
+          options,
+        )
     }
     |> result.map_error(normalise_error),
   )
@@ -165,9 +154,197 @@ pub fn dispatch_bits(
   Ok(Response(status, list.map(headers, string_header), resp_body))
 }
 
+fn base_erl_options() -> List(ErlOption) {
+  [
+    BodyFormat(Binary),
+    SocketOpts([Ipfamily(Inet6fb4)]),
+    Ipv6HostWithBrackets(True),
+  ]
+}
+
+fn erl_url(req: Request(BitArray)) -> Charlist {
+  req
+  |> request.set_host(bracket_ipv6_host(req.host))
+  |> request.to_uri
+  |> uri.to_string
+  |> charlist.from_string
+}
+
+fn erl_content_type(req: Request(BitArray)) -> Charlist {
+  req
+  |> request.get_header("content-type")
+  |> result.unwrap("application/octet-stream")
+  |> charlist.from_string
+}
+
+fn erl_http_options(config: Configuration) -> List(ErlHttpOption) {
+  let options = [
+    Autoredirect(config.follow_redirects),
+    Timeout(config.timeout),
+  ]
+  case config.verify_tls {
+    True -> options
+    False -> [Ssl([Verify(VerifyNone)]), ..options]
+  }
+}
+
+fn method_has_body(method: Method) -> Bool {
+  case method {
+    http.Options | http.Head | http.Get -> False
+    http.Post
+    | http.Put
+    | http.Delete
+    | http.Trace
+    | http.Connect
+    | http.Patch
+    | http.Other(_) -> True
+  }
+}
+
+@external(erlang, "httpc", "request")
+fn erl_stream_request(
+  a: Method,
+  b: #(Charlist, List(#(Charlist, Charlist)), Charlist, BitArray),
+  c: List(ErlHttpOption),
+  d: List(ErlOption),
+) -> Result(RequestId, Dynamic)
+
+@external(erlang, "httpc", "request")
+fn erl_stream_request_no_body(
+  a: Method,
+  b: #(Charlist, List(#(Charlist, Charlist))),
+  c: List(ErlHttpOption),
+  d: List(ErlOption),
+) -> Result(RequestId, Dynamic)
+
+@external(erlang, "gleam_httpc_ffi", "cast_http_message")
+fn cast_http_message(message: Dynamic) -> HttpMessage
+
+/// Identifies a streaming request, so that messages from different requests
+/// can be told apart.
+///
+pub type RequestId
+
+/// A streamed response body, used to ask for the next chunk.
+///
+pub type Stream
+
+/// Messages that can be sent by a streaming request to the process that
+/// started it.
+///
+pub type HttpMessage {
+  /// The response headers have been received and the body will follow.
+  StreamStart(id: RequestId, stream: Stream, headers: List(#(String, String)))
+  /// A piece of the response body has been received. There is no guarantee
+  /// that a chunk is a valid UTF-8 string.
+  StreamChunk(id: RequestId, stream: Stream, data: BitArray)
+  /// The response body is complete. Chunked encoding can add headers, so
+  /// there may be more here than in `StreamStart`.
+  StreamEnd(id: RequestId, stream: Stream, headers: List(#(String, String)))
+  /// An error has occurred and the request has stopped.
+  StreamError(id: RequestId, stream: Stream, error: HttpError)
+  /// The whole response has been received at once, as only 200 and 206
+  /// responses are streamed. No further messages follow.
+  CompleteResponse(id: RequestId, response: Response(BitArray))
+}
+
+/// Send a HTTP request of binary data, receiving the response body as
+/// messages rather than all at once.
+///
+/// Returns once the request has been made, without waiting for the response.
+/// Messages are sent to the process that called this function and can be
+/// received with the `select_http_messages` function.
+///
+/// No part of the body is read until it is asked for with the
+/// `receive_next_chunk_as_message` function, so a fast server will not
+/// overwhelm a slow consumer.
+///
+/// Note the timeout applies to the whole request rather than to each chunk,
+/// so a long running stream needs a long timeout.
+///
+pub fn dispatch_stream_bits(
+  config: Configuration,
+  req: Request(BitArray),
+) -> Result(RequestId, HttpError) {
+  let options = [
+    Sync(False),
+    Stream(#(atom.create("self"), atom.create("once"))),
+    Receiver(
+      #(atom.create("gleam_httpc_ffi"), atom.create("stream_receiver"), [
+        process.self(),
+      ]),
+    ),
+    ..base_erl_options()
+  ]
+
+  let url = erl_url(req)
+  let headers = prepare_headers(req.headers)
+  let http_options = erl_http_options(config)
+
+  case method_has_body(req.method) {
+    False ->
+      erl_stream_request_no_body(
+        req.method,
+        #(url, headers),
+        http_options,
+        options,
+      )
+    True ->
+      erl_stream_request(
+        req.method,
+        #(url, headers, erl_content_type(req), req.body),
+        http_options,
+        options,
+      )
+  }
+  |> result.map_error(normalise_error)
+}
+
+@external(erlang, "httpc", "stream_next")
+fn erl_stream_next(stream: Stream) -> atom.Atom
+
+/// Ask for the next chunk of a streamed response body, which will be sent as
+/// a message to the process that started the request.
+///
+/// This permits one read of the socket rather than one message, so a single
+/// call may be answered by a `Chunk` and a `StreamEnd` together.
+///
+pub fn receive_next_chunk_as_message(stream: Stream) -> Nil {
+  let _ = erl_stream_next(stream)
+  Nil
+}
+
+@external(erlang, "httpc", "cancel_request")
+fn erl_cancel_request(id: RequestId) -> atom.Atom
+
+/// Stop a streaming request, discarding the rest of the response.
+///
+pub fn cancel_stream(id: RequestId) -> Nil {
+  let _ = erl_cancel_request(id)
+  Nil
+}
+
+/// Configure a selector to receive messages from streaming HTTP requests.
+///
+/// This will receive messages from all streaming requests that the process has
+/// started, rather than any specific one. Each message carries the id of the
+/// request that sent it.
+///
+pub fn select_http_messages(
+  selector: process.Selector(t),
+  mapping: fn(HttpMessage) -> t,
+) -> process.Selector(t) {
+  process.select_record(
+    selector,
+    tag: atom.create("gleam_httpc"),
+    fields: 1,
+    mapping: fn(message) { mapping(cast_http_message(message)) },
+  )
+}
+
 /// Configuration that can be used to send HTTP requests.
 ///
-/// To be used with `dispatch` and `dispatch_bits`.
+/// To be used with `dispatch`, `dispatch_bits` and `dispatch_stream_bits`.
 ///
 pub opaque type Configuration {
   Builder(
@@ -225,6 +402,9 @@ pub fn follow_redirects(config: Configuration, which: Bool) -> Configuration {
 ///
 /// If the response is not recieved within this amount of time then the
 /// client disconnects and an error is returned.
+///
+/// The timeout applies to the whole request, so a streamed response body has
+/// to arrive in full within it.
 ///
 pub fn timeout(config: Configuration, timeout: Int) -> Configuration {
   Builder(..config, timeout:)

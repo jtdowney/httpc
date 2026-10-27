@@ -8,6 +8,7 @@ Bindings to Erlang's built in HTTP client, `httpc`.
 ```sh
 gleam add gleam_httpc@5
 ```
+
 ```gleam
 import gleam/http/request
 import gleam/http/response
@@ -34,6 +35,53 @@ pub fn send_request() {
   assert resp.body == "{\"message\":\"Hello World\"}"
 
   Ok(resp)
+}
+```
+
+## Streaming a response body
+
+`dispatch_stream_bits` returns once the request has been made, and the response
+arrives as messages.
+
+```gleam
+import gleam/bit_array
+import gleam/erlang/process
+import gleam/function
+import gleam/http/request
+import gleam/httpc
+import gleam/io
+
+pub fn stream_request() {
+  let assert Ok(req) = request.to("https://example.com/a-large-file")
+
+  // The timeout covers the whole stream
+  let assert Ok(_id) =
+    httpc.configure()
+    |> httpc.timeout(600_000)
+    |> httpc.dispatch_stream_bits(request.map(req, bit_array.from_string))
+
+  process.new_selector()
+  |> httpc.select_http_messages(fn(message) { message })
+  |> handle_stream
+}
+
+fn handle_stream(selector) {
+  case process.selector_receive_forever(selector) {
+    // Ask for a chunk, and for another each time one arrives
+    httpc.StreamStart(_id, stream, _headers) -> {
+      httpc.receive_next_chunk_as_message(stream)
+      handle_stream(selector)
+    }
+    httpc.StreamChunk(_id, stream, data) -> {
+      io.println("got " <> bit_array.inspect(data))
+      httpc.receive_next_chunk_as_message(stream)
+      handle_stream(selector)
+    }
+    httpc.StreamEnd(_id, _stream, _headers) -> Ok(Nil)
+    httpc.StreamError(_id, _stream, error) -> Error(error)
+    // Only 200 and 206 responses are streamed
+    httpc.CompleteResponse(_id, _stream, _response) -> Ok(Nil)
+  }
 }
 ```
 

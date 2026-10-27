@@ -10,7 +10,9 @@ import gleam/http/response.{type Response}
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{None}
 import gleam/result
+import glisten
 import mist.{type Connection, type ResponseData}
 
 pub type MockResponse {
@@ -68,6 +70,49 @@ fn test_response(req: Request(Connection)) -> Response(ResponseData) {
   |> response.set_body(mist.Bytes(bytes_tree.from_string(body)))
 }
 
+fn chunked_response(
+  req: Request(Connection),
+  count count: Int,
+  delay delay: Int,
+  abort abort: Bool,
+) -> Response(ResponseData) {
+  let echoed = case mist.read_body(req, max_body_limit: 1_000_000) {
+    Ok(read) -> read.body
+    Error(_) -> <<>>
+  }
+
+  mist.chunked(
+    request: req,
+    response: response.new(200),
+    init: fn(subject) {
+      process.send(subject, Nil)
+      #(subject, 0)
+    },
+    loop: fn(state, _message, connection) {
+      let #(subject, sent) = state
+      case sent < count {
+        False ->
+          case abort {
+            True -> mist.chunk_stop_abnormal("aborted")
+            False -> mist.chunk_stop()
+          }
+        True -> {
+          process.sleep(delay)
+          let prefix = case sent {
+            0 -> echoed
+            _ -> <<>>
+          }
+          let name = bit_array.from_string("chunk" <> int.to_string(sent))
+          let assert Ok(Nil) =
+            mist.send_chunk(connection, bit_array.append(prefix, name))
+          process.send(subject, Nil)
+          mist.chunk_continue(#(subject, sent + 1))
+        }
+      }
+    },
+  )
+}
+
 fn http_handler(req: Request(Connection)) -> Response(ResponseData) {
   case request.path_segments(req), req.method {
     [], http.Head ->
@@ -93,10 +138,42 @@ fn http_handler(req: Request(Connection)) -> Response(ResponseData) {
 
     ["redirected"], _ -> test_response(req)
 
+    ["stream", count, delay], _ -> {
+      let assert Ok(count) = int.parse(count)
+      let assert Ok(delay) = int.parse(delay)
+      chunked_response(req, count:, delay:, abort: False)
+    }
+
+    ["stream-abort", count, delay], _ -> {
+      let assert Ok(count) = int.parse(count)
+      let assert Ok(delay) = int.parse(delay)
+      chunked_response(req, count:, delay:, abort: True)
+    }
+
     _, _ ->
       response.new(404)
-      |> response.set_body(mist.Bytes(bytes_tree.new()))
+      |> response.set_body(mist.Bytes(bytes_tree.from_string("not found")))
   }
+}
+
+/// Canned responses that mist cannot produce because it frames its own
+/// output. One listener per response, so nothing has to parse the request.
+fn start_raw(key: String, response: String) -> Nil {
+  let name = process.new_name(key)
+
+  let assert Ok(_) =
+    glisten.new(
+      fn(_connection) { #(Nil, None) },
+      fn(_state, _message, connection) {
+        let assert Ok(Nil) =
+          glisten.send(connection, bytes_tree.from_string(response))
+        glisten.stop()
+      },
+    )
+    |> glisten.with_listener_name(name)
+    |> glisten.start(0)
+
+  pt_put(atom.create(key), glisten.get_server_info(name, 5000).port)
 }
 
 fn start_http() -> Nil {
@@ -115,6 +192,11 @@ fn start_http() -> Nil {
 
 pub fn start() -> Nil {
   start_http()
+  start_raw(
+    "truncated_port",
+    "HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\ntruncated",
+  )
+  start_raw("garbage_port", "this is not an http response\r\n\r\n")
 }
 
 pub fn http_port() -> Int {
@@ -123,6 +205,20 @@ pub fn http_port() -> Int {
 
 pub fn url(path: String) -> String {
   "http://localhost:" <> int.to_string(http_port()) <> path
+}
+
+/// A response claiming more body than the server sends before hanging up.
+pub fn truncated_url() -> String {
+  raw_url("truncated_port")
+}
+
+/// A response that is not HTTP at all.
+pub fn garbage_url() -> String {
+  raw_url("garbage_port")
+}
+
+fn raw_url(key: String) -> String {
+  "http://localhost:" <> int.to_string(pt_get(atom.create(key))) <> "/"
 }
 
 pub fn ipv6_url(path: String) -> String {

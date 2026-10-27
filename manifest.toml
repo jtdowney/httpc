@@ -28,4 +28,5 @@ gleam_http = { version = ">= 3.0.0 and < 5.0.0" }
 gleam_json = { version = ">= 3.1.0 and < 4.0.0" }
 gleam_stdlib = { version = ">= 0.32.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
+glisten = { version = ">= 9.0.0 and < 10.0.0" }
 mist = { version = ">= 6.0.0 and < 7.0.0" }

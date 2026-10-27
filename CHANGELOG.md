@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Added the `dispatch_stream_bits`, `receive_next_chunk_as_message`,
+  `select_http_messages`, and `cancel_stream` functions for streaming a
+  response body.
+- Added the `SocketClosedRemotely` error. A truncated content-length delimited
+  response now returns this instead of crashing the caller.
+- Added the `InvalidResponse` error, returned when the server sends something
+  that cannot be understood as HTTP.
 - Fixed a bug where requests to IPv6 literal hosts would fail.
 
 ## v5.0.0 - 2025-07-12
